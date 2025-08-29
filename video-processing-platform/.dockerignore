@@ -1,0 +1,67 @@
+# Python
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+.Python
+env
+pip-log.txt
+pip-delete-this-directory.txt
+.tox
+.coverage
+.coverage.*
+.cache
+nosetests.xml
+coverage.xml
+*.cover
+*.log
+.git
+.mypy_cache
+.pytest_cache
+.hypothesis
+
+# IDE
+.DS_Store
+.vscode
+.idea
+*.swp
+*.swo
+
+# Node
+node_modules
+npm-debug.log*
+
+# Environment
+.env
+.env.local
+.env.*.local
+
+# Build
+dist
+build
+*.egg-info
+
+# Project specific
+output/
+temp/
+cache/
+logs/
+*.mp4
+*.mkv
+*.avi
+*.mov
+
+# Documentation
+docs/_build/
+
+# Testing
+.coverage
+htmlcov/
+.pytest_cache/
+
+# Development
+.git/
+.gitignore
+README.md
+docker-compose.dev.yml
+Makefile

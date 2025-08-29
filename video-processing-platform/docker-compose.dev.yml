@@ -1,0 +1,127 @@
+version: '3.8'
+
+services:
+  # Development API Server
+  api:
+    build:
+      context: .
+      target: development
+    ports:
+      - "8000:8000"
+    environment:
+      - DATABASE_URL=postgresql://postgres:password@db:5432/video_processing_dev
+      - REDIS_URL=redis://redis:6379/0
+      - SECRET_KEY=dev-secret-key-not-for-production
+      - ENVIRONMENT=development
+      - DEBUG=true
+      - ENABLE_GPU=false
+      - LOG_LEVEL=debug
+    depends_on:
+      - db
+      - redis
+    volumes:
+      - .:/app
+      - ./output:/app/output
+      - ./temp:/app/temp
+      - ./cache:/app/cache
+      - ./logs:/app/logs
+    restart: unless-stopped
+    command: ["video-processor", "server", "start", "--host", "0.0.0.0", "--reload"]
+
+  # Development Worker
+  worker:
+    build:
+      context: .
+      target: development
+    environment:
+      - DATABASE_URL=postgresql://postgres:password@db:5432/video_processing_dev
+      - REDIS_URL=redis://redis:6379/0
+      - SECRET_KEY=dev-secret-key-not-for-production
+      - ENVIRONMENT=development
+      - DEBUG=true
+      - ENABLE_GPU=false
+      - LOG_LEVEL=debug
+    depends_on:
+      - db
+      - redis
+    volumes:
+      - .:/app
+      - ./output:/app/output
+      - ./temp:/app/temp
+      - ./cache:/app/cache
+      - ./logs:/app/logs
+    restart: unless-stopped
+    command: ["video-processor", "worker", "start", "--loglevel", "debug"]
+
+  # Flower Monitoring
+  flower:
+    build:
+      context: .
+      target: development
+    command: ["video-processor", "worker", "monitor"]
+    ports:
+      - "5555:5555"
+    environment:
+      - REDIS_URL=redis://redis:6379/0
+    depends_on:
+      - redis
+    volumes:
+      - .:/app
+
+  # PostgreSQL Database
+  db:
+    image: postgres:15-alpine
+    environment:
+      - POSTGRES_DB=video_processing_dev
+      - POSTGRES_USER=postgres
+      - POSTGRES_PASSWORD=password
+    volumes:
+      - postgres_dev_data:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+    restart: unless-stopped
+
+  # Redis Cache & Message Broker
+  redis:
+    image: redis:7-alpine
+    command: redis-server --appendonly yes
+    volumes:
+      - redis_dev_data:/data
+    ports:
+      - "6379:6379"
+    restart: unless-stopped
+
+  # pgAdmin for database management
+  pgadmin:
+    image: dpage/pgadmin4
+    environment:
+      - PGADMIN_DEFAULT_EMAIL=admin@example.com
+      - PGADMIN_DEFAULT_PASSWORD=admin
+    ports:
+      - "5050:80"
+    depends_on:
+      - db
+    volumes:
+      - pgadmin_data:/var/lib/pgadmin
+    profiles:
+      - tools
+
+  # Redis Commander for Redis management
+  redis-commander:
+    image: rediscommander/redis-commander:latest
+    environment:
+      - REDIS_HOSTS=local:redis:6379
+    ports:
+      - "8081:8081"
+    depends_on:
+      - redis
+    profiles:
+      - tools
+
+volumes:
+  postgres_dev_data:
+    driver: local
+  redis_dev_data:
+    driver: local
+  pgadmin_data:
+    driver: local

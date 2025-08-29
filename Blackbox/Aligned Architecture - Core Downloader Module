@@ -1,0 +1,377 @@
+#!/usr/bin/env python3
+"""
+src/core/downloader.py
+Advanced Video Downloader Module - Following Enterprise Architecture
+"""
+
+import asyncio
+import hashlib
+import json
+from abc import ABC, abstractmethod
+from dataclasses import dataclass
+from pathlib import Path
+from typing import List, Optional, Dict, Any, Protocol
+
+import aiohttp
+import yt_dlp
+from rich.progress import Progress, TaskID
+
+from ..utils.constants import (
+    MAX_CONCURRENT_DOWNLOADS,
+    CHUNK_SIZE,
+    USER_AGENT,
+    MAX_RETRIES,
+    TIMEOUT
+)
+from ..utils.exceptions import (
+    DownloadError,
+    NetworkError,
+    ValidationError
+)
+from ..utils.decorators import retry, rate_limit, log_execution_time
+from ..database.repositories.job_repo import JobRepository
+from ..services.cache_service import CacheService
+from ..services.storage_service import StorageService
+
+
+@dataclass
+class DownloadConfig:
+    """Download configuration"""
+    max_connections: int = MAX_CONCURRENT_DOWNLOADS
+    chunk_size: int = CHUNK_SIZE
+    use_aria2c: bool = True
+    verify_hash: bool = True
+    resume_enabled: bool = True
+    headers: Optional[Dict[str, str]] = None
+
+
+@dataclass
+class DownloadResult:
+    """Download result container"""
+    url: str
+    local_path: Path
+    size: int
+    duration: float
+    hash: Optional[str] = None
+    metadata: Optional[Dict[str, Any]] = None
+
+
+class DownloadStrategy(ABC):
+    """Abstract download strategy"""
+    
+    @abstractmethod
+    async def download(
+        self,
+        url: str,
+        output_path: Path,
+        config: DownloadConfig,
+        progress_callback: Optional[callable] = None
+    ) -> DownloadResult:
+        """Execute download strategy"""
+        pass
+
+
+class YtDlpStrategy(DownloadStrategy):
+    """YouTube-DL based download strategy"""
+    
+    def __init__(self, cache_service: CacheService):
+        self.cache_service = cache_service
+    
+    @retry(max_attempts=MAX_RETRIES)
+    @log_execution_time
+    async def download(
+        self,
+        url: str,
+        output_path: Path,
+        config: DownloadConfig,
+        progress_callback: Optional[callable] = None
+    ) -> DownloadResult:
+        """Download using yt-dlp with advanced options"""
+        
+        # Check cache first
+        cache_key = f"download:{hashlib.md5(url.encode()).hexdigest()}"
+        cached = await self.cache_service.get(cache_key)
+        if cached and Path(cached['path']).exists():
+            return DownloadResult(**cached)
+        
+        ydl_opts = self._build_ydl_options(output_path, config, progress_callback)
+        
+        loop = asyncio.get_event_loop()
+        result = await loop.run_in_executor(
+            None,
+            self._execute_download,
+            url,
+            ydl_opts
+        )
+        
+        # Cache the result
+        await self.cache_service.set(cache_key, result.__dict__, ttl=3600)
+        
+        return result
+    
+    def _build_ydl_options(
+        self,
+        output_path: Path,
+        config: DownloadConfig,
+        progress_callback: Optional[callable]
+    ) -> dict:
+        """Build yt-dlp options"""
+        opts = {
+            'format': 'bestvideo[height=1080]+bestaudio/best[height=1080]',
+            'outtmpl': str(output_path),
+            'merge_output_format': 'mp4',
+            'concurrent_fragment_downloads': config.max_connections,
+            'retries': MAX_RETRIES,
+            'fragment_retries': MAX_RETRIES,
+            'skip_unavailable_fragments': False,
+            'quiet': True,
+            'no_warnings': False,
+        }
+        
+        if config.use_aria2c:
+            opts['external_downloader'] = 'aria2c'
+            opts['external_downloader_args'] = self._get_aria2c_args(config)
+        
+        if config.headers:
+            opts['http_headers'] = config.headers
+        
+        if progress_callback:
+            opts['progress_hooks'] = [progress_callback]
+        
+        return opts
+    
+    def _get_aria2c_args(self, config: DownloadConfig) -> list:
+        """Get aria2c arguments"""
+        return [
+            '-x', str(config.max_connections),
+            '-s', str(config.max_connections),
+            '-k', '1M',
+            '--file-allocation=none',
+            '--continue=true',
+            '--max-connection-per-server=' + str(config.max_connections),
+        ]
+    
+    def _execute_download(self, url: str, options: dict) -> DownloadResult:
+        """Execute the actual download"""
+        import time
+        start_time = time.time()
+        
+        with yt_dlp.YoutubeDL(options) as ydl:
+            info = ydl.extract_info(url, download=True)
+            
+            return DownloadResult(
+                url=url,
+                local_path=Path(options['outtmpl']),
+                size=info.get('filesize', 0),
+                duration=time.time() - start_time,
+                metadata={
+                    'title': info.get('title'),
+                    'duration': info.get('duration'),
+                    'format': info.get('format'),
+                }
+            )
+
+
+class DirectDownloadStrategy(DownloadStrategy):
+    """Direct HTTP download strategy with chunking"""
+    
+    def __init__(self, storage_service: StorageService):
+        self.storage_service = storage_service
+    
+    @retry(max_attempts=MAX_RETRIES)
+    @rate_limit(calls=10, period=1)
+    async def download(
+        self,
+        url: str,
+        output_path: Path,
+        config: DownloadConfig,
+        progress_callback: Optional[callable] = None
+    ) -> DownloadResult:
+        """Direct download with resume support"""
+        import time
+        start_time = time.time()
+        
+        async with aiohttp.ClientSession() as session:
+            # Get file info
+            file_info = await self._get_file_info(session, url)
+            
+            # Check for resume
+            resume_from = 0
+            if config.resume_enabled and output_path.exists():
+                resume_from = output_path.stat().st_size
+            
+            if resume_from >= file_info['size']:
+                return DownloadResult(
+                    url=url,
+                    local_path=output_path,
+                    size=file_info['size'],
+                    duration=0
+                )
+            
+            # Download with chunks
+            await self._download_chunks(
+                session,
+                url,
+                output_path,
+                file_info['size'],
+                resume_from,
+                config.chunk_size,
+                progress_callback
+            )
+            
+            # Verify if requested
+            download_hash = None
+            if config.verify_hash:
+                download_hash = await self._calculate_hash(output_path)
+            
+            return DownloadResult(
+                url=url,
+                local_path=output_path,
+                size=file_info['size'],
+                duration=time.time() - start_time,
+                hash=download_hash
+            )
+    
+    async def _get_file_info(self, session: aiohttp.ClientSession, url: str) -> dict:
+        """Get file information from headers"""
+        async with session.head(url) as response:
+            return {
+                'size': int(response.headers.get('Content-Length', 0)),
+                'supports_range': response.headers.get('Accept-Ranges') == 'bytes',
+                'content_type': response.headers.get('Content-Type', '')
+            }
+    
+    async def _download_chunks(
+        self,
+        session: aiohttp.ClientSession,
+        url: str,
+        output_path: Path,
+        total_size: int,
+        resume_from: int,
+        chunk_size: int,
+        progress_callback: Optional[callable]
+    ):
+        """Download file in chunks"""
+        headers = {}
+        if resume_from > 0:
+            headers['Range'] = f'bytes={resume_from}-'
+        
+        async with session.get(url, headers=headers) as response:
+            response.raise_for_status()
+            
+            mode = 'ab' if resume_from > 0 else 'wb'
+            downloaded = resume_from
+            
+            async with aiofiles.open(output_path, mode) as file:
+                async for chunk in response.content.iter_chunked(chunk_size):
+                    await file.write(chunk)
+                    downloaded += len(chunk)
+                    
+                    if progress_callback:
+                        progress_callback(downloaded, total_size)
+    
+    async def _calculate_hash(self, file_path: Path) -> str:
+        """Calculate file hash"""
+        import hashlib
+        sha256_hash = hashlib.sha256()
+        
+        async with aiofiles.open(file_path, 'rb') as f:
+            while chunk := await f.read(8192):
+                sha256_hash.update(chunk)
+        
+        return sha256_hash.hexdigest()
+
+
+class DownloadManager:
+    """Main download manager orchestrating strategies"""
+    
+    def __init__(
+        self,
+        cache_service: CacheService,
+        storage_service: StorageService,
+        job_repo: JobRepository
+    ):
+        self.cache_service = cache_service
+        self.storage_service = storage_service
+        self.job_repo = job_repo
+        
+        # Initialize strategies
+        self.strategies = {
+            'yt_dlp': YtDlpStrategy(cache_service),
+            'direct': DirectDownloadStrategy(storage_service)
+        }
+    
+    async def download_batch(
+        self,
+        urls: List[str],
+        output_dir: Path,
+        config: Optional[DownloadConfig] = None,
+        job_id: Optional[str] = None
+    ) -> List[DownloadResult]:
+        """Download multiple URLs concurrently"""
+        config = config or DownloadConfig()
+        results = []
+        
+        # Update job status
+        if job_id:
+            await self.job_repo.update_status(job_id, 'downloading')
+        
+        # Create semaphore for concurrency control
+        semaphore = asyncio.Semaphore(config.max_connections)
+        
+        async def download_with_semaphore(url: str, index: int) -> DownloadResult:
+            async with semaphore:
+                output_path = output_dir / f"episode_{index:03d}.mp4"
+                
+                # Choose strategy based on URL
+                strategy = self._select_strategy(url)
+                
+                # Create progress callback
+                def progress_callback(current, total):
+                    if job_id:
+                        asyncio.create_task(
+                            self.job_repo.update_progress(
+                                job_id,
+                                f"episode_{index}",
+                                (current / total) * 100
+                            )
+                        )
+                
+                return await strategy.download(
+                    url,
+                    output_path,
+                    config,
+                    progress_callback
+                )
+        
+        # Download all URLs concurrently
+        tasks = [
+            download_with_semaphore(url, i + 1)
+            for i, url in enumerate(urls)
+        ]
+        
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        
+        # Filter out exceptions and log them
+        successful_results = []
+        for i, result in enumerate(results):
+            if isinstance(result, Exception):
+                # Log error
+                print(f"Download failed for URL {i+1}: {result}")
+                if job_id:
+                    await self.job_repo.add_error(job_id, str(result))
+            else:
+                successful_results.append(result)
+        
+        return successful_results
+    
+    def _select_strategy(self, url: str) -> DownloadStrategy:
+        """Select appropriate download strategy based on URL"""
+        # Simple heuristic - can be extended
+        if 'youtube' in url or 'topcinema' in url:
+            return self.strategies['yt_dlp']
+        return self.strategies['direct']
+    
+    async def cleanup_temp_files(self, directory: Path):
+        """Clean up temporary files"""
+        await self.storage_service.cleanup_directory(directory)

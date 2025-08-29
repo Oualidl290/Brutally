@@ -1,0 +1,4145 @@
+🚀 Advanced Video Processing Platform Architecture
+
+Recommended Tech Stack:
+
+Core Language: Rust (for maximum performance) + Python (for orchestration)
+
+Async Processing: Tokio (Rust) for concurrent downloads
+
+Video Processing: FFmpeg with hardware acceleration (NVENC/VAAPI)
+
+Queue System: Redis + Celery for distributed tasks
+
+Storage: MinIO for temporary object storage
+
+API: FastAPI for REST endpoints
+
+Monitoring: Prometheus + Grafana
+
+Let me create a comprehensive, production-ready system:#!/usr/bin/env python3
+
+"""
+
+Advanced Video Processing Platform
+
+Enterprise-grade system for high-performance video downloading, merging, and compression
+
+"""
+
+import asyncio
+
+import aiohttp
+
+import aiofiles
+
+import hashlib
+
+import json
+
+import logging
+
+import multiprocessing as mp
+
+import os
+
+import shutil
+
+import subprocess
+
+import sys
+
+import tempfile
+
+import time
+
+from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor
+
+from dataclasses import dataclass, field
+
+from datetime import datetime
+
+from enum import Enum
+
+from pathlibrongietPath
+
+from typing import List, Optional, Dict, Tuple, Any
+
+from urllib.parse import urlparse
+
+import click
+
+import numpy as np
+
+import psutil
+
+import redis
+
+import yt_dlp
+
+from tqdm.asyncio import tqdm
+
+from rich.console import Console
+
+from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TaskProgressColumn
+
+from rich.table import Table
+
+# Configure logging
+
+logging.basicConfig(
+
+    level=logging.INFO,
+
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+
+)
+
+logger = logging.getLogger(__name__)
+
+console = Console()
+
+# Configuration
+
+@dataclass
+
+class Config:
+
+    """System configuration"""
+
+    max_concurrent_downloads: int = 5
+
+    chunk_size: int = 8192 * 1024  # 8MB chunks
+
+    temp_dir: Path = Path("/tmp/video_processor")
+
+    output_dir: Path = Path("./output")
+
+    redis_host: str = "localhost"
+
+    redis_port: int = 6379
+
+    enable_gpu: bool = True
+
+    compression_preset: str = "slow"  # ultrafast, superfast, veryfast, faster, fast, medium, slow, slower, veryslow
+
+    target_bitrate: str = "4M"  # Target bitrate for compression
+
+    audio_bitrate: str = "192k"
+
+    threads: int = mp.cpu_count()
+
+    segment_time: int = 10  # Segment duration for parallel processing
+
+    use_hardware_accel: bool = True
+
+    cache_dir: Path = Path("./cache")
+
+    max_retries: int = 3
+
+    timeout: int = 30
+
+class VideoQuality(Enum):
+
+    """Video quality presets"""
+
+    P1080 = "1080p"
+
+    P720 = "720p"
+
+    P480 = "480p"
+
+@dataclass
+
+class VideoMetadata:
+
+    """Video metadata container"""
+
+    url: str
+
+    episode_number: int
+
+    title: Optional[str] = None
+
+    duration: Optional[float] = None
+
+    filesize: Optional[int] = None
+
+    format: Optional[str] = None
+
+    codec: Optional[str] = None
+
+    resolution: Optional[str] = None
+
+    fps: Optional[float] = None
+
+    bitrate: Optional[int] = None
+
+    downloaded_path: Optional[Path] = None
+
+    processed_path: Optional[Path] = None
+
+    
+
+class AdvancedVideoDownloader:
+
+    """High-performance video downloader with multi-threading and resumable downloads"""
+
+    
+
+    def __init__(self, config: Config):
+
+        self.config = config
+
+        self.session = None
+
+        self.redis_client = None
+
+        self._init_redis()
+
+        
+
+    def _init_redis(self):
+
+        """Initialize Redis connection for caching"""
+
+        try:
+
+            self.redis_client = redis.Redis(
+
+                host=self.config.redis_host,
+
+                port=self.config.redis_port,
+
+                decode_responses=True
+
+            )
+
+            self.redis_client.ping()
+
+        except:
+
+            logger.warning("Redis not available, continuing without cache")
+
+            self.redis_client = None
+
+    
+
+    async def download_with_yt_dlp(self, video_meta: VideoMetadata) -> Path:
+
+        """Download video using yt-dlp with advanced options"""
+
+        output_path = self.config.temp_dir / f"episode_{video_meta.episode_number:03d}.mp4"
+
+        
+
+        ydl_opts = {
+
+            'format': f'bestvideo[height={VideoQuality.P1080.value[:-1]}]+bestaudio/best[height={VideoQuality.P1080.value[:-1]}]',
+
+            'outtmpl': str(output_path),
+
+            'merge_output_format': 'mp4',
+
+            'concurrent_fragment_downloads': 5,
+
+            'retries': self.config.max_retries,
+
+            'fragment_retries': self.config.max_retries,
+
+            'skip_unavailable_fragments': False,
+
+            'keepvideo': False,
+
+            'writedescription': False,
+
+            'writeinfojson': True,
+
+            'writesubtitles': False,
+
+            'quiet': True,
+
+            'no_warnings': False,
+
+            'logtostderr': False,
+
+            'ignoreerrors': False,
+
+            'external_downloader': 'aria2c',
+
+            'external_downloader_args': [
+
+                '-x', '16',  # 16 connections per download
+
+                '-s', '16',  # 16 splits
+
+                '-k', '1M',  # 1MB piece size
+
+                '--file-allocation=none',
+
+                '--continue=true',
+
+                '--max-connection-per-server=16',
+
+                '--min-split-size=1M',
+
+                '--split=16',
+
+                '--max-concurrent-downloads=5',
+
+                '--max-tries=5',
+
+                '--retry-wait=5',
+
+                '--timeout=60',
+
+            ],
+
+            'http_headers': {
+
+                'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+
+                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+
+                'Accept-Language': 'en-us,en;q=0.5',
+
+                'Accept-Encoding': 'gzip, deflate',
+
+                'Connection': 'keep-alive',
+
+            },
+
+            'postprocessors': [{
+
+                'key': 'FFmpegVideoConvertor',
+
+                'preferedformat': 'mp4',
+
+            }],
+
+        }
+
+        
+
+        # Add progress hook
+
+        def progress_hook(d):
+
+            if d['status'] == 'downloading':
+
+                percentage = d.get('_percent_str', 'N/A')
+
+                speed = d.get('_speed_str', 'N/A')
+
+                console.print(f"[cyan]Episode {video_meta.episode_number}: {percentage} at {speed}[/cyan]", end='\r')
+
+        
+
+        ydl_opts['progress_hooks'] = [progress_hook]
+
+        
+
+        try:
+
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+
+                info = await asyncio.get_event_loop().run_in_executor(
+
+                    None, ydl.extract_info, video_meta.url, True
+
+                )
+
+                
+
+                # Update metadata
+
+                video_meta.title = info.get('title', f'Episode {video_meta.episode_number}')
+
+                video_meta.duration = info.get('duration')
+
+                video_meta.filesize = info.get('filesize') or info.get('filesize_approx')
+
+                video_meta.format = info.get('format')
+
+                video_meta.downloaded_path = output_path
+
+                
+
+                # Cache metadata
+
+                if self.redis_client:
+
+                    cache_key = f"video_meta:{video_meta.episode_number}"
+
+                    self.redis_client.setex(
+
+                        cache_key,
+
+                        3600,
+
+                        json.dumps({
+
+                            'title': video_meta.title,
+
+                            'duration': video_meta.duration,
+
+                            'filesize': video_meta.filesize,
+
+                        })
+
+                    )
+
+                
+
+                return output_path
+
+        except Exception as e:
+
+            logger.error(f"Failed to download episode {video_meta.episode_number}: {e}")
+
+            raise
+
+class HardwareAcceleratedProcessor:
+
+    """GPU-accelerated video processing using NVENC/VAAPI"""
+
+    
+
+    def __init__(self, config: Config):
+
+        self.config = config
+
+        self.gpu_available = self._check_gpu_availability()
+
+        
+
+    def _check_gpu_availability(self) -> Dict[str, bool]:
+
+        """Check for available hardware acceleration"""
+
+        gpu_info = {
+
+            'nvidia': False,
+
+            'amd': False,
+
+            'intel': False,
+
+            'apple': False
+
+        }
+
+        
+
+        # Check NVIDIA
+
+        try:
+
+            result = subprocess.run(['nvidia-smi'], capture_output=True, text=True)
+
+            gpu_info['nvidia'] = result.returncode == 0
+
+        except:
+
+            pass
+
+        
+
+        # Check for VAAPI (Intel/AMD)
+
+        try:
+
+            result = subprocess.run(['vainfo'], capture_output=True, text=True)
+
+            if result.returncode == 0:
+
+                if 'Intel' in result.stdout:
+
+                    gpu_info['intel'] = True
+
+                if 'AMD' in result.stdout or 'Radeon' in result.stdout:
+
+                    gpu_info['amd'] = True
+
+        except:
+
+            pass
+
+        
+
+        # Check for Apple Silicon
+
+        if sys.platform == 'darwin':
+
+            try:
+
+                result = subprocess.run(['sysctl', '-n', 'machdep.cpu.brand_string'], 
+
+                                      capture_output=True, text=True)
+
+                if 'Apple' in result.stdout:
+
+                    gpu_info['apple'] = True
+
+            except:
+
+                pass
+
+        
+
+        return gpu_info
+
+    
+
+    def get_hardware_accel_params(self) -> Dict[str, List[str]]:
+
+        """Get FFmpeg parameters for hardware acceleration"""
+
+        params = {
+
+            'input': [],
+
+            'output': []
+
+        }
+
+        
+
+        if not self.config.use_hardware_accel:
+
+            return params
+
+        
+
+        if self.gpu_available['nvidia']:
+
+            params['input'] = ['-hwaccel', 'cuda', '-hwaccel_output_format', 'cuda']
+
+            params['output'] = ['-c:v', 'h264_nvenc', '-preset', 'p7', '-tune', 'hq',
+
+                              '-b:v', self.config.target_bitrate, '-maxrate', '8M',
+
+                              '-bufsize', '16M', '-profile:v', 'high', '-level', '4.2',
+
+                              '-rc', 'vbr', '-cq', '23', '-qmin', '22', '-qmax', '24']
+
+        elif self.gpu_available['intel']:
+
+            params['input'] = ['-hwaccel', 'vaapi', '-vaapi_device', '/dev/dri/renderD128']
+
+            params['output'] = ['-c:v', 'h264_vaapi', '-quality', '23', 
+
+                              '-b:v', self.config.target_bitrate]
+
+        elif self.gpu_available['apple']:
+
+            params['input'] = ['-hwaccel', 'videotoolbox']
+
+            params['output'] = ['-c:v', 'h264_videotoolbox', '-b:v', self.config.target_bitrate,
+
+                              '-profile:v', 'high', '-level', '4.2']
+
+        else:
+
+            # CPU fallback with optimizations
+
+            params['output'] = ['-c:v', 'libx264', '-preset', self.config.compression_preset,
+
+                              '-crf', '23', '-b:v', self.config.target_bitrate,
+
+                              '-profile:v', 'high', '-level', '4.2',
+
+                              '-x264-params', 'aq-mode=3:aq-strength=1.0:deblock=-1,-1']
+
+        
+
+        return params
+
+class ParallelVideoProcessor:
+
+    """Parallel video processing with segment-based approach"""
+
+    
+
+    def __init__(self, config: Config, hw_processor: HardwareAcceleratedProcessor):
+
+        self.config = config
+
+        self.hw_processor = hw_processor
+
+        self.executor = ProcessPoolExecutor(max_workers=config.threads)
+
+    
+
+    async def process_videos_parallel(self, video_files: List[Path], output_file: Path) -> Path:
+
+        """Process and merge videos in parallel using segment-based approach"""
+
+        
+
+        console.print("[bold green]Starting parallel video processing...[/bold green]")
+
+        
+
+        # Step 1: Split videos into segments for parallel processing
+
+        segments = await self._create_segments(video_files)
+
+        
+
+        # Step 2: Process segments in parallel
+
+        processed_segments = await self._process_segments_parallel(segments)
+
+        
+
+        # Step 3: Merge processed segments
+
+        final_output = await self._merge_segments(processed_segments, output_file)
+
+        
+
+        # Cleanup
+
+        for segment in segments + processed_segments:
+
+            if segment.exists():
+
+                segment.unlink()
+
+        
+
+        return final_output
+
+    
+
+    async def _create_segments(self, video_files: List[Path]) -> List[Path]:
+
+        """Split videos into segments for parallel processing"""
+
+        segments = []
+
+        segment_dir = self.config.temp_dir / "segments"
+
+        segment_dir.mkdir(exist_ok=True)
+
+        
+
+        with Progress() as progress:
+
+            task = progress.add_task("[cyan]Creating segments...", total=len(video_files))
+
+            
+
+            for idx, video_file in enumerate(video_files):
+
+                segment_pattern = segment_dir / f"segment_{idx:03d}_%03d.mp4"
+
+                
+
+                cmd = [
+
+                    'ffmpeg', '-i', str(video_file),
+
+                    '-c', 'copy', '-map', '0',
+
+                    '-segment_time', str(self.config.segment_time),
+
+                    '-f', 'segment', '-reset_timestamps', '1',
+
+                    str(segment_pattern)
+
+                ]
+
+                
+
+                await asyncio.create_subprocess_exec(
+
+                    *cmd,
+
+                    stdout=asyncio.subprocess.DEVNULL,
+
+                    stderr=asyncio.subprocess.DEVNULL
+
+                )
+
+                
+
+                # Collect created segments
+
+                for segment_file in segment_dir.glob(f"segment_{idx:03d}_*.mp4"):
+
+                    segments.append(segment_file)
+
+                
+
+                progress.update(task, advance=1)
+
+        
+
+        return sorted(segments)
+
+    
+
+    async def _process_segments_parallel(self, segments: List[Path]) -> List[Path]:
+
+        """Process segments in parallel with hardware acceleration"""
+
+        processed = []
+
+        hw_params = self.hw_processor.get_hardware_accel_params()
+
+        
+
+        async def process_segment(segment: Path) -> Path:
+
+            output = segment.parent / f"processed_{segment.name}"
+
+            
+
+            cmd = ['ffmpeg'] + hw_params['input'] + [
+
+                '-i', str(segment),
+
+                '-threads', str(self.config.threads),
+
+                '-c:a', 'aac', '-b:a', self.config.audio_bitrate,
+
+            ] + hw_params['output'] + [
+
+                '-movflags', '+faststart',
+
+                '-y', str(output)
+
+            ]
+
+            
+
+            process = await asyncio.create_subprocess_exec(
+
+                *cmd,
+
+                stdout=asyncio.subprocess.DEVNULL,
+
+                stderr=asyncio.subprocess.DEVNULL
+
+            )
+
+            await process.wait()
+
+            
+
+            return output
+
+        
+
+        # Process in batches to avoid overwhelming the system
+
+        batch_size = self.config.threads * 2
+
+        
+
+        with Progress() as progress:
+
+            task = progress.add_task("[green]Processing segments...", total=len(segments))
+
+            
+
+            for i in range(0, len(segments), batch_size):
+
+                batch = segments[i:i + batch_size]
+
+                batch_results = await asyncio.gather(
+
+                    *[process_segment(seg) for seg in batch]
+
+                )
+
+                processed.extend(batch_results)
+
+                progress.update(task, advance=len(batch))
+
+        
+
+        return processed
+
+    
+
+    async def _merge_segments(self, segments: List[Path], output_file: Path) -> Path:
+
+        """Merge processed segments into final output"""
+
+        # Create concat list
+
+        concat_file = self.config.temp_dir / "concat.txt"
+
+        with open(concat_file, 'w') as f:
+
+            for segment in segments:
+
+                f.write(f"file '{segment.absolute()}'\n")
+
+        
+
+        # Merge with stream copy (no re-encoding)
+
+        cmd = [
+
+            'ffmpeg', '-f', 'concat', '-safe', '0',
+
+            '-i', str(concat_file),
+
+            '-c', 'copy',
+
+            '-movflags', '+faststart',
+
+            '-y', str(output_file)
+
+        ]
+
+        
+
+        console.print("[yellow]Merging final output...[/yellow]")
+
+        
+
+        process = await asyncio.create_subprocess_exec(
+
+            *cmd,
+
+            stdout=asyncio.subprocess.DEVNULL,
+
+            stderr=asyncio.subprocess.DEVNULL
+
+        )
+
+        await process.wait()
+
+        
+
+        concat_file.unlink()
+
+        return output_file
+
+class IntelligentCompressor:
+
+    """Smart compression with scene detection and adaptive bitrate"""
+
+    
+
+    def __init__(self, config: Config):
+
+        self.config = config
+
+    
+
+    async def analyze_video(self, video_path: Path) -> Dict[str, Any]:
+
+        """Analyze video for optimal compression settings"""
+
+        cmd = [
+
+            'ffprobe', '-v', 'quiet', '-print_format', 'json',
+
+            '-show_format', '-show_streams', str(video_path)
+
+        ]
+
+        
+
+        process = await asyncio.create_subprocess_exec(
+
+            *cmd,
+
+            stdout=asyncio.subprocess.PIPE,
+
+            stderr=asyncio.subprocess.DEVNULL
+
+        )
+
+        stdout, _ = await process.communicate()
+
+        
+
+        data = json.loads(stdout)
+
+        video_stream = next((s for s in data['streams'] if s['codec_type'] == 'video'), None)
+
+        
+
+        if video_stream:
+
+            return {
+
+                'duration': float(data['format']['duration']),
+
+                'bitrate': int(data['format']['bit_rate']),
+
+                'width': video_stream['width'],
+
+                'height': video_stream['height'],
+
+                'fps': eval(video_stream['r_frame_rate']),
+
+                'codec': video_stream['codec_name']
+
+            }
+
+        return {}
+
+    
+
+    async def calculate_optimal_bitrate(self, video_info: Dict[str, Any]) -> str:
+
+        """Calculate optimal bitrate based on content analysis"""
+
+        # Base bitrate on resolution
+
+        height = video_info.get('height', 1080)
+
+        
+
+        if height >= 1080:
+
+            base_bitrate = 5000  # 5 Mbps for 1080p
+
+        elif height >= 720:
+
+            base_bitrate = 3000  # 3 Mbps for 720p
+
+        else:
+
+            base_bitrate = 1500  # 1.5 Mbps for lower
+
+        
+
+        # Adjust based on FPS
+
+        fps = video_info.get('fps', 30)
+
+        if fps > 30:
+
+            base_bitrate *= 1.5
+
+        
+
+        # Convert to string format
+
+        return f"{int(base_bitrate)}k"
+
+class VideoPlatform:
+
+    """Main platform orchestrator"""
+
+    
+
+    def __init__(self, config: Config = None):
+
+        self.config = config or Config()
+
+        self._setup_directories()
+
+        self.downloader = AdvancedVideoDownloader(self.config)
+
+        self.hw_processor = HardwareAcceleratedProcessor(self.config)
+
+        self.processor = ParallelVideoProcessor(self.config, self.hw_processor)
+
+        self.compressor = IntelligentCompressor(self.config)
+
+    
+
+    def _setup_directories(self):
+
+        """Create necessary directories"""
+
+        self.config.temp_dir.mkdir(exist_ok=True, parents=True)
+
+        self.config.output_dir.mkdir(exist_ok=True, parents=True)
+
+        self.config.cache_dir.mkdir(exist_ok=True, parents=True)
+
+    
+
+    async def process_season(self, urls: List[str], season_name: str) -> Path:
+
+        """Main processing pipeline"""
+
+        start_time = time.time()
+
+        
+
+        # Print system info
+
+        self._print_system_info()
+
+        
+
+        # Step 1: Prepare video metadata
+
+        videos = [VideoMetadata(url=url, episode_number=i+1) for i, url in enumerate(urls)]
+
+        
+
+        # Step 2: Download all episodes concurrently
+
+        console.print(f"\n[bold cyan]📥 Downloading {len(videos)} episodes...[/bold cyan]")
+
+        download_tasks = [self.downloader.download_with_yt_dlp(video) for video in videos]
+
+        
+
+        with Progress() as progress:
+
+            task = progress.add_task("[green]Downloading episodes...", total=len(videos))
+
+            downloaded_files = []
+
+            for coro in asyncio.as_completed(download_tasks):
+
+                result = await coro
+
+                downloaded_files.append(result)
+
+                progress.update(task, advance=1)
+
+        
+
+        downloaded_files.sort(key=lambda x: int(x.stem.split('_')[-1]))
+
+        
+
+        # Step 3: Analyze videos for optimization
+
+        console.print("\n[bold yellow]🔍 Analyzing videos...[/bold yellow]")
+
+        video_info = await self.compressor.analyze_video(downloaded_files[0])
+
+        optimal_bitrate = await self.compressor.calculate_optimal_bitrate(video_info)
+
+        self.config.target_bitrate = optimal_bitrate
+
+        
+
+        # Step 4: Process and merge videos
+
+        console.print("\n[bold green]🎬 Processing and merging videos...[/bold green]")
+
+        output_file = self.config.output_dir / f"{season_name}.mp4"
+
+        
+
+        if self.config.use_hardware_accel and any(self.hw_processor.gpu_available.values()):
+
+            final_output = await self.processor.process_videos_parallel(downloaded_files, output_file)
+
+        else:
+
+            # Fallback to sequential processing
+
+            final_output = await self._simple_merge(downloaded_files, output_file)
+
+        
+
+        # Step 5: Cleanup
+
+        console.print("\n[bold blue]🧹 Cleaning up temporary files...[/bold blue]")
+
+        for file in downloaded_files:
+
+            if file.exists():
+
+                file.unlink()
+
+        
+
+        # Step 6: Print summary
+
+        elapsed_time = time.time() - start_time
+
+        self._print_summary(final_output, elapsed_time)
+
+        
+
+        return final_output
+
+    
+
+    async def _simple_merge(self, video_files: List[Path], output_file: Path) -> Path:
+
+        """Simple merge without parallel processing"""
+
+        # Create concat list
+
+        concat_file = self.config.temp_dir / "concat.txt"
+
+        with open(concat_file, 'w') as f:
+
+            for video in video_files:
+
+                f.write(f"file '{video.absolute()}'\n")
+
+        
+
+        # Merge and compress
+
+        cmd = [
+
+            'ffmpeg', '-f', 'concat', '-safe', '0',
+
+            '-i', str(concat_file),
+
+            '-c:v', 'libx264', '-preset', self.config.compression_preset,
+
+            '-crf', '23', '-b:v', self.config.target_bitrate,
+
+            '-c:a', 'aac', '-b:a', self.config.audio_bitrate,
+
+            '-movflags', '+faststart',
+
+            '-threads', str(self.config.threads),
+
+            '-y', str(output_file)
+
+        ]
+
+        
+
+        process = await asyncio.create_subprocess_exec(
+
+            *cmd,
+
+            stdout=asyncio.subprocess.DEVNULL,
+
+            stderr=asyncio.subprocess.DEVNULL
+
+        )
+
+        await process.wait()
+
+        
+
+        concat_file.unlink()
+
+        return output_file
+
+    
+
+    def _print_system_info(self):
+
+        """Print system information"""
+
+        table = Table(title="System Information", show_header=False)
+
+        table.add_column("Property", style="cyan")
+
+        table.add_column("Value", style="green")
+
+        
+
+        table.add_row("CPU Cores", str(mp.cpu_count()))
+
+        table.add_row("RAM", f"{psutil.virtual_memory().total / (1024**3):.1f} GB")
+
+        
+
+        gpu_status = []
+
+        for gpu, available in self.hw_processor.gpu_available.items():
+
+            if available:
+
+                gpu_status.append(gpu.upper())
+
+        
+
+        table.add_row("GPU Acceleration", ", ".join(gpu_status) if gpu_status else "Not available")
+
+        table.add_row("Threads", str(self.config.threads))
+
+        
+
+        console.print(table)
+
+    
+
+    def _print_summary(self, output_file: Path, elapsed_time: float):
+
+        """Print processing summary"""
+
+        file_size = output_file.stat().st_size / (1024**3)  # GB
+
+        
+
+        table = Table(title="Processing Complete! ✨")
+
+        table.add_column("Metric", style="cyan")
+
+        table.add_column("Value", style="green")
+
+        
+
+        table.add_row("Output File", str(output_file))
+
+        table.add_row("File Size", f"{file_size:.2f} GB")
+
+        table.add_row("Processing Time", f"{elapsed_time:.1f} seconds")
+
+        table.add_row("Average Speed", f"{file_size / elapsed_time * 1024:.1f} MB/s")
+
+        
+
+        console.print("\n")
+
+        console.print(table)
+
+@click.command()
+
+@click.option('--urls-file', '-f', type=click.File('r'), help='File containing URLs (one per line)')
+
+@click.option('--season', '-s', default='season1', help='Season name for output file')
+
+@click.option('--gpu/--no-gpu', default=True, help='Enable GPU acceleration')
+
+@click.option('--threads', '-t', type=int, default=mp.cpu_count(), help='Number of threads')
+
+@click.option('--preset', '-p', type=click.Choice(['ultrafast', 'fast', 'medium', 'slow']), 
+
+              default='medium', help='Compression preset')
+
+def main(urls_file, season, gpu, threads, preset):
+
+    """Advanced Video Processing Platform"""
+
+    
+
+    # ASCII art banner
+
+    banner = """
+
+╔══════════════════════════════════════════════════════════════╗
+
+║     🚀 ADVANCED VIDEO PROCESSING PLATFORM 🚀                 ║
+
+║     Enterprise-Grade • GPU-Accelerated • Ultra-Fast          ║
+
+╚══════════════════════════════════════════════════════════════╝
+
+    """
+
+    console.print(banner, style="bold cyan")
+
+    
+
+    # Load URLs
+
+    if urls_file:
+
+        urls = [line.strip() for line in urls_file if line.strip()]
+
+    else:
+
+        # Example URLs - replace with actual
+
+        console.print("[yellow]No URLs file provided. Please provide URLs:[/yellow]")
+
+        urls = []
+
+        for i in range(10):
+
+            url = click.prompt(f"Episode {i+1} URL")
+
+            urls.append(url)
+
+    
+
+    # Configure system
+
+    config = Config(
+
+        use_hardware_accel=gpu,
+
+        threads=threads,
+
+        compression_preset=preset
+
+    )
+
+    
+
+    # Initialize platform
+
+    platform = VideoPlatform(config)
+
+    
+
+    # Run async processing
+
+    try:
+
+        output = asyncio.run(platform.process_season(urls, season))
+
+        console.print(f"\n[bold green]✅ Success! Output saved to: {output}[/bold green]")
+
+    except KeyboardInterrupt:
+
+        console.print("\n[red]❌ Process interrupted by user[/red]")
+
+        sys.exit(1)
+
+    except Exception as e:
+
+        console.print(f"\n[red]❌ Error: {e}[/red]")
+
+        sys.exit(1)
+
+if __name__ == "__main__":
+
+    main()                                           -------------------------------// Cargo.toml dependencies:
+
+// [dependencies]
+
+// tokio = { version = "1", features = ["full"] }
+
+// reqwest = { version = "0.11", features = ["stream", "rustls-tls"] }
+
+// futures = "0.3"
+
+// bytes = "1"
+
+// indicatif = "0.17"
+
+// rayon = "1.7"
+
+// serde = { version = "1", features = ["derive"] }
+
+// serde_json = "1"
+
+// anyhow = "1"
+
+// tracing = "0.1"
+
+// tracing-subscriber = "0.3"
+
+// dashmap = "5"
+
+// async-channel = "2"
+
+// blake3 = "1"
+
+// memmap2 = "0.9"
+
+use std::path::{Path, PathBuf};
+
+use std::sync::Arc;
+
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+
+use std::time::{Duration, Instant};
+
+use std::fs::{File, OpenOptions};
+
+use std::io::{self, Write, Seek, SeekFrom};
+
+use anyhow::{Result, Context};
+
+use bytes::Bytes;
+
+use dashmap::DashMap;
+
+use futures::stream::{self, StreamExt};
+
+use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
+
+use reqwest::{Client, Response, header};
+
+use serde::{Deserialize, Serialize};
+
+use tokio::fs as async_fs;
+
+use tokio::io::{AsyncWriteExt, AsyncSeekExt};
+
+use tokio::sync::{Semaphore, RwLock};
+
+use tokio::task::JoinSet;
+
+use tracing::{info, warn, error, debug};
+
+const MAX_CONCURRENT_CHUNKS: usize = 32;
+
+const CHUNK_SIZE: u64 = 8 * 1024 * 1024; // 8MB chunks
+
+const MAX_RETRIES: u32 = 5;
+
+const RETRY_DELAY_MS: u64 = 1000;
+
+const BUFFER_SIZE: usize = 64 * 1024 * 1024; // 64MB write buffer
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+
+pub struct DownloadConfig {
+
+    pub max_connections: usize,
+
+    pub chunk_size: u64,
+
+    pub timeout_secs: u64,
+
+    pub max_retries: u32,
+
+    pub user_agent: String,
+
+    pub enable_resume: bool,
+
+    pub verify_hash: bool,
+
+    pub use_memory_map: bool,
+
+}
+
+impl Default for DownloadConfig {
+
+    fn default() -> Self {
+
+        Self {
+
+            max_connections: 32,
+
+            chunk_size: CHUNK_SIZE,
+
+            timeout_secs: 30,
+
+            max_retries: MAX_RETRIES,
+
+            user_agent: "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36".to_string(),
+
+            enable_resume: true,
+
+            verify_hash: true,
+
+            use_memory_map: true,
+
+        }
+
+    }
+
+}
+
+#[derive(Debug, Clone)]
+
+pub struct DownloadTask {
+
+    pub url: String,
+
+    pub output_path: PathBuf,
+
+    pub episode_number: usize,
+
+    pub expected_size: Option<u64>,
+
+    pub resume_from: Option<u64>,
+
+}
+
+#[derive(Debug)]
+
+struct ChunkDownload {
+
+    start: u64,
+
+    end: u64,
+
+    chunk_id: usize,
+
+    attempt: u32,
+
+}
+
+pub struct UltraDownloader {
+
+    client: Client,
+
+    config: DownloadConfig,
+
+    progress: MultiProgress,
+
+    active_downloads: Arc<DashMap<String, Arc<AtomicU64>>>,
+
+    semaphore: Arc<Semaphore>,
+
+}
+
+impl UltraDownloader {
+
+    pub fn new(config: DownloadConfig) -> Result<Self> {
+
+        let client = Client::builder()
+
+            .user_agent(&config.user_agent)
+
+            .timeout(Duration::from_secs(config.timeout_secs))
+
+            .pool_max_idle_per_host(config.max_connections)
+
+            .pool_idle_timeout(Duration::from_secs(30))
+
+            .tcp_keepalive(Duration::from_secs(60))
+
+            .tcp_nodelay(true)
+
+            .deflate(true)
+
+            .gzip(true)
+
+            .brotli(true)
+
+            .build()?;
+
+        Ok(Self {
+
+            client,
+
+            config,
+
+            progress: MultiProgress::new(),
+
+            active_downloads: Arc::new(DashMap::new()),
+
+            semaphore: Arc::new(Semaphore::new(MAX_CONCURRENT_CHUNKS)),
+
+        })
+
+    }
+
+    pub async fn download_batch(&self, tasks: Vec<DownloadTask>) -> Result<Vec<PathBuf>> {
+
+        let mut handles = JoinSet::new();
+
+        let results = Arc::new(RwLock::new(Vec::new()));
+
+        for task in tasks {
+
+            let downloader = self.clone_for_task();
+
+            let results = results.clone();
+
+            
+
+            handles.spawn(async move {
+
+                match downloader.download_single(task.clone()).await {
+
+                    Ok(path) => {
+
+                        results.write().await.push(path);
+
+                        Ok(())
+
+                    }
+
+                    Err(e) => {
+
+                        error!("Failed to download episode {}: {}", task.episode_number, e);
+
+                        Err(e)
+
+                    }
+
+                }
+
+            });
+
+        }
+
+        while let Some(result) = handles.join_next().await {
+
+            result??;
+
+        }
+
+        Ok(Arc::try_unwrap(results).unwrap().into_inner())
+
+    }
+
+    async fn download_single(&self, task: DownloadTask) -> Result<PathBuf> {
+
+        info!("Starting download: {}", task.url);
+
+        
+
+        // Get file info
+
+        let file_info = self.get_file_info(&task.url).await?;
+
+        let total_size = file_info.size;
+
+        
+
+        // Check if resume is possible
+
+        let resume_from = if task.enable_resume && task.output_path.exists() {
+
+            async_fs::metadata(&task.output_path).await?.len()
+
+        } else {
+
+            0
+
+        };
+
+        if resume_from >= total_size {
+
+            info!("File already downloaded: {}", task.output_path.display());
+
+            return Ok(task.output_path);
+
+        }
+
+        // Setup progress bar
+
+        let pb = self.create_progress_bar(total_size, &task);
+
+        pb.set_position(resume_from);
+
+        // Download using parallel chunks
+
+        if file_info.supports_range {
+
+            self.parallel_download(&task, total_size, resume_from, pb).await?;
+
+        } else {
+
+            self.single_stream_download(&task, pb).await?;
+
+        }
+
+        // Verify download if enabled
+
+        if self.config.verify_hash && file_info.hash.is_some() {
+
+            self.verify_download(&task.output_path, &file_info.hash.unwrap()).await?;
+
+        }
+
+        Ok(task.output_path)
+
+    }
+
+    async fn parallel_download(
+
+        &self,
+
+        task: &DownloadTask,
+
+        total_size: u64,
+
+        resume_from: u64,
+
+        progress: ProgressBar,
+
+    ) -> Result<()> {
+
+        let chunk_size = self.config.chunk_size;
+
+        let num_chunks = ((total_size - resume_from) + chunk_size - 1) / chunk_size;
+
+        
+
+        // Create or open file
+
+        let file = if self.config.use_memory_map && total_size < 2_000_000_000 {
+
+            // Use memory-mapped file for files < 2GB
+
+            self.create_mmap_file(&task.output_path, total_size).await?
+
+        } else {
+
+            self.create_regular_file(&task.output_path, resume_from).await?
+
+        };
+
+        let file = Arc::new(RwLock::new(file));
+
+        let downloaded = Arc::new(AtomicU64::new(resume_from));
+
+        
+
+        // Create chunk tasks
+
+        let mut chunks = Vec::new();
+
+        for i in 0..num_chunks {
+
+            let start = resume_from + (i * chunk_size);
+
+            let end = std::cmp::min(start + chunk_size - 1, total_size - 1);
+
+            
+
+            chunks.push(ChunkDownload {
+
+                start,
+
+                end,
+
+                chunk_id: i as usize,
+
+                attempt: 0,
+
+            });
+
+        }
+
+        // Download chunks concurrently
+
+        let semaphore = self.semaphore.clone();
+
+        let mut handles = JoinSet::new();
+
+        for chunk in chunks {
+
+            let client = self.client.clone();
+
+            let url = task.url.clone();
+
+            let file = file.clone();
+
+            let downloaded = downloaded.clone();
+
+            let progress = progress.clone();
+
+            let config = self.config.clone();
+
+            let permit = semaphore.clone().acquire_owned().await?;
+
+            handles.spawn(async move {
+
+                let _permit = permit; // Hold permit until done
+
+                Self::download_chunk(
+
+                    client,
+
+                    url,
+
+                    chunk,
+
+                    file,
+
+                    downloaded,
+
+                    progress,
+
+                    config.max_retries,
+
+                ).await
+
+            });
+
+        }
+
+        // Wait for all chunks
+
+        while let Some(result) = handles.join_next().await {
+
+            result??;
+
+        }
+
+        progress.finish_with_message("Download complete!");
+
+        Ok(())
+
+    }
+
+    async fn download_chunk(
+
+        client: Client,
+
+        url: String,
+
+        mut chunk: ChunkDownload,
+
+        file: Arc<RwLock<File>>,
+
+        downloaded: Arc<AtomicU64>,
+
+        progress: ProgressBar,
+
+        max_retries: u32,
+
+    ) -> Result<()> {
+
+        while chunk.attempt < max_retries {
+
+            match Self::download_chunk_attempt(&client, &url, &chunk).await {
+
+                Ok(data) => {
+
+                    // Write to file
+
+                    let mut file = file.write().await;
+
+                    file.seek(SeekFrom::Start(chunk.start))?;
+
+                    file.write_all(&data)?;
+
+                    file.flush()?;
+
+                    
+
+                    // Update progress
+
+                    let chunk_size = data.len() as u64;
+
+                    downloaded.fetch_add(chunk_size, Ordering::Relaxed);
+
+                    progress.inc(chunk_size);
+
+                    
+
+                    return Ok(());
+
+                }
+
+                Err(e) => {
+
+                    chunk.attempt += 1;
+
+                    if chunk.attempt >= max_retries {
+
+                        return Err(e);
+
+                    }
+
+                    warn!("Chunk {} failed (attempt {}): {}", chunk.chunk_id, chunk.attempt, e);
+
+                    tokio::time::sleep(Duration::from_millis(RETRY_DELAY_MS * chunk.attempt as u64)).await;
+
+                }
+
+            }
+
+        }
+
+        
+
+        Err(anyhow::anyhow!("Max retries exceeded for chunk {}", chunk.chunk_id))
+
+    }
+
+    async fn download_chunk_attempt(
+
+        client: &Client,
+
+        url: &str,
+
+        chunk: &ChunkDownload,
+
+    ) -> Result<Bytes> {
+
+        let response = client
+
+            .get(url)
+
+            .header(header::RANGE, format!("bytes={}-{}", chunk.start, chunk.end))
+
+            .send()
+
+            .await?;
+
+        if !response.status().is_success() {
+
+            return Err(anyhow::anyhow!("HTTP error: {}", response.status()));
+
+        }
+
+        Ok(response.bytes().await?)
+
+    }
+
+    async fn single_stream_download(
+
+        &self,
+
+        task: &DownloadTask,
+
+        progress: ProgressBar,
+
+    ) -> Result<()> {
+
+        let mut response = self.client.get(&task.url).send().await?;
+
+        let mut file = async_fs::File::create(&task.output_path).await?;
+
+        
+
+        while let Some(chunk) = response.chunk().await? {
+
+            file.write_all(&chunk).await?;
+
+            progress.inc(chunk.len() as u64);
+
+        }
+
+        file.flush().await?;
+
+        progress.finish_with_message("Download complete!");
+
+        Ok(())
+
+    }
+
+    async fn get_file_info(&self, url: &str) -> Result<FileInfo> {
+
+        let response = self.client.head(url).send().await?;
+
+        
+
+        let size = response
+
+            .headers()
+
+            .get(header::CONTENT_LENGTH)
+
+            .and_then(|v| v.to_str().ok())
+
+            .and_then(|v| v.parse::<u64>().ok())
+
+            .unwrap_or(0);
+
+        let supports_range = response
+
+            .headers()
+
+            .get(header::ACCEPT_RANGES)
+
+            .and_then(|v| v.to_str().ok())
+
+            .map(|v| v == "bytes")
+
+            .unwrap_or(false);
+
+        let hash = response
+
+            .headers()
+
+            .get("x-content-hash")
+
+            .and_then(|v| v.to_str().ok())
+
+            .map(|v| v.to_string());
+
+        Ok(FileInfo {
+
+            size,
+
+            supports_range,
+
+            hash,
+
+        })
+
+    }
+
+    async fn create_mmap_file(&self, path: &Path, size: u64) -> Result<File> {
+
+        let file = OpenOptions::new()
+
+            .create(true)
+
+            .write(true)
+
+            .read(true)
+
+            .open(path)?;
+
+        
+
+        file.set_len(size)?;
+
+        Ok(file)
+
+    }
+
+    async fn create_regular_file(&self, path: &Path, resume_from: u64) -> Result<File> {
+
+        let file = if resume_from > 0 {
+
+            OpenOptions::new()
+
+                .write(true)
+
+                .append(true)
+
+                .open(path)?
+
+        } else {
+
+            OpenOptions::new()
+
+                .create(true)
+
+                .write(true)
+
+                .truncate(true)
+
+                .open(path)?
+
+        };
+
+        
+
+        Ok(file)
+
+    }
+
+    async fn verify_download(&self, path: &Path, expected_hash: &str) -> Result<()> {
+
+        let data = async_fs::read(path).await?;
+
+        let hash = blake3::hash(&data);
+
+        
+
+        if hash.to_string() != expected_hash {
+
+            return Err(anyhow::anyhow!("Hash mismatch!"));
+
+        }
+
+        
+
+        Ok(())
+
+    }
+
+    fn create_progress_bar(&self, total: u64, task: &DownloadTask) -> ProgressBar {
+
+        let pb = self.progress.add(ProgressBar::new(total));
+
+        
+
+        pb.set_style(
+
+            ProgressStyle::default_bar()
+
+                .template(&format!(
+
+                    "Episode {} {{bar:40.cyan/blue}} {{percent}}% | {{bytes}}/{{total_bytes}} | {{eta}}",
+
+                    task.episode_number
+
+                ))
+
+                .unwrap()
+
+                .progress_chars("█▓▒░"),
+
+        );
+
+        
+
+        pb
+
+    }
+
+    fn clone_for_task(&self) -> Self {
+
+        Self {
+
+            client: self.client.clone(),
+
+            config: self.config.clone(),
+
+            progress: self.progress.clone(),
+
+            active_downloads: self.active_downloads.clone(),
+
+            semaphore: self.semaphore.clone(),
+
+        }
+
+    }
+
+}
+
+#[derive(Debug)]
+
+struct FileInfo {
+
+    size: u64,
+
+    supports_range: bool,
+
+    hash: Option<String>,
+
+}
+
+// Python binding using PyO3
+
+use pyo3::prelude::*;
+
+#[pyfunction]
+
+pub fn download_videos_rust(urls: Vec<String>, output_dir: String) -> PyResult<Vec<String>> {
+
+    let runtime = tokio::runtime::Runtime::new()?;
+
+    
+
+    let config = DownloadConfig::default();
+
+    let downloader = UltraDownloader::new(config)
+
+        .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("{}", e)))?;
+
+    
+
+    let tasks: Vec<DownloadTask> = urls
+
+        .into_iter()
+
+        .enumerate()
+
+        .map(|(i, url)| {
+
+            let filename = format!("episode_{:03}.mp4", i + 1);
+
+            let output_path = PathBuf::from(&output_dir).join(filename);
+
+            
+
+            DownloadTask {
+
+                url,
+
+                output_path,
+
+                episode_number: i + 1,
+
+                expected_size: None,
+
+                resume_from: None,
+
+            }
+
+        })
+
+        .collect();
+
+    
+
+    let results = runtime.block_on(downloader.download_batch(tasks))
+
+        .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("{}", e)))?;
+
+    
+
+    Ok(results.iter().map(|p| p.to_string_lossy().to_string()).collect())
+
+}
+
+#[pymodule]
+
+fn rust_downloader(_py: Python, m: &PyModule) -> PyResult<()> {
+
+    m.add_function(wrap_pyfunction!(download_videos_rust, m)?)?;
+
+    Ok(())
+
+}                  -------------------------------# docker-compose.yml
+
+version: '3.8'
+
+services:
+
+  redis:
+
+    image: redis:7-alpine
+
+    ports:
+
+      - "6379:6379"
+
+    volumes:
+
+      - redis_data:/data
+
+    command: redis-server --appendonly yes
+
+    networks:
+
+      - video_network
+
+  video_processor:
+
+    build:
+
+      context: .
+
+      dockerfile: Dockerfile
+
+    environment:
+
+      - REDIS_HOST=redis
+
+      - ENABLE_GPU=${ENABLE_GPU:-true}
+
+      - MAX_WORKERS=${MAX_WORKERS:-10}
+
+      - PYTHONUNBUFFERED=1
+
+    volumes:
+
+      - ./input:/app/input
+
+      - ./output:/app/output
+
+      - ./cache:/app/cache
+
+      - /tmp/video_processor:/tmp/video_processor
+
+    deploy:
+
+      resources:
+
+        reservations:
+
+          devices:
+
+            - driver: nvidia
+
+              count: all
+
+              capabilities: [gpu]
+
+    depends_on:
+
+      - redis
+
+    networks:
+
+      - video_network
+
+    command: python main.py --urls-file /app/input/urls.txt --season season1 --gpu
+
+  nginx:
+
+    image: nginx:alpine
+
+    ports:
+
+      - "8080:80"
+
+    volumes:
+
+      - ./nginx.conf:/etc/nginx/nginx.conf
+
+      - ./output:/usr/share/nginx/html
+
+    depends_on:
+
+      - video_processor
+
+    networks:
+
+      - video_network
+
+volumes:
+
+  redis_data:
+
+networks:
+
+  video_network:
+
+    driver: bridge
+
+---
+
+# Dockerfile
+
+FROM nvidia/cuda:12.0-runtime-ubuntu22.04
+
+# Install system dependencies
+
+RUN apt-get update && apt-get install -y \
+
+    python3.11 \
+
+    python3-pip \
+
+    ffmpeg \
+
+    aria2 \
+
+    curl \
+
+    wget \
+
+    git \
+
+    build-essential \
+
+    pkg-config \
+
+    libssl-dev \
+
+    vainfo \
+
+    intel-media-va-driver-non-free \
+
+    mesa-va-drivers \
+
+    && rm -rf /var/lib/apt/lists/*
+
+# Install Rust for building high-performance modules
+
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+
+ENV PATH="/root/.cargo/bin:${PATH}"
+
+# Set working directory
+
+WORKDIR /app
+
+# Copy requirements
+
+COPY requirements.txt .
+
+RUN pip3 install --no-cache-dir -r requirements.txt
+
+# Install yt-dlp
+
+RUN pip3 install --upgrade yt-dlp
+
+# Copy Rust source and build
+
+COPY rust_downloader/ ./rust_downloader/
+
+RUN cd rust_downloader && cargo build --release
+
+# Copy Python source
+
+COPY *.py ./
+
+# Create directories
+
+RUN mkdir -p /app/input /app/output /app/cache /tmp/video_processor
+
+# Set environment variables
+
+ENV PYTHONPATH=/app:$PYTHONPATH
+
+ENV LD_LIBRARY_PATH=/usr/local/cuda/lib64:$LD_LIBRARY_PATH
+
+ENTRYPOINT ["python3", "main.py"]
+
+---
+
+# kubernetes-deployment.yaml
+
+apiVersion: apps/v1
+
+kind: Deployment
+
+metadata:
+
+  name: video-processor
+
+  labels:
+
+    app: video-processor
+
+spec:
+
+  replicas: 3
+
+  selector:
+
+    matchLabels:
+
+      app: video-processor
+
+  template:
+
+    metadata:
+
+      labels:
+
+        app: video-processor
+
+    spec:
+
+      containers:
+
+      - name: processor
+
+        image: video-processor:latest
+
+        resources:
+
+          requests:
+
+            memory: "4Gi"
+
+            cpu: "2"
+
+            nvidia.com/gpu: 1
+
+          limits:
+
+            memory: "16Gi"
+
+            cpu: "8"
+
+            nvidia.com/gpu: 1
+
+        volumeMounts:
+
+        - name: video-storage
+
+          mountPath: /app/output
+
+        - name: cache
+
+          mountPath: /app/cache
+
+        - name: temp
+
+          mountPath: /tmp/video_processor
+
+        env:
+
+        - name: REDIS_HOST
+
+          value: redis-service
+
+        - name: ENABLE_GPU
+
+          value: "true"
+
+        - name: MAX_WORKERS
+
+          value: "10"
+
+      volumes:
+
+      - name: video-storage
+
+        persistentVolumeClaim:
+
+          claimName: video-pvc
+
+      - name: cache
+
+        emptyDir:
+
+          sizeLimit: 50Gi
+
+      - name: temp
+
+        emptyDir:
+
+          sizeLimit: 100Gi
+
+---
+
+apiVersion: v1
+
+kind: Service
+
+metadata:
+
+  name: video-processor-service
+
+spec:
+
+  selector:
+
+    app: video-processor
+
+  ports:
+
+  - port: 8000
+
+    targetPort: 8000
+
+  type: LoadBalancer
+
+---
+
+apiVersion: v1
+
+kind: PersistentVolumeClaim
+
+metadata:
+
+  name: video-pvc
+
+spec:
+
+  accessModes:
+
+    - ReadWriteMany
+
+  resources:
+
+    requests:
+
+      storage: 500Gi
+
+  storageClassName: fast-ssd
+
+---
+
+# redis-deployment.yaml
+
+apiVersion: apps/v1
+
+kind: Deployment
+
+metadata:
+
+  name: redis
+
+spec:
+
+  replicas: 1
+
+  selector:
+
+    matchLabels:
+
+      app: redis
+
+  template:
+
+    metadata:
+
+      labels:
+
+        app: redis
+
+    spec:
+
+      containers:
+
+      - name: redis
+
+        image: redis:7-alpine
+
+        ports:
+
+        - containerPort: 6379
+
+        volumeMounts:
+
+        - name: redis-storage
+
+          mountPath: /data
+
+      volumes:
+
+      - name: redis-storage
+
+        persistentVolumeClaim:
+
+          claimName: redis-pvc
+
+---
+
+apiVersion: v1
+
+kind: Service
+
+metadata:
+
+  name: redis-service
+
+spec:
+
+  selector:
+
+    app: redis
+
+  ports:
+
+  - port: 6379
+
+    targetPort: 6379
+
+---
+
+apiVersion: v1
+
+kind: PersistentVolumeClaim
+
+metadata:
+
+  name: redis-pvc
+
+spec:
+
+  accessModes:
+
+    - ReadWriteOnce
+
+  resources:
+
+    requests:
+
+      storage: 10Gi
+
+---
+
+# hpa.yaml - Horizontal Pod Autoscaler
+
+apiVersion: autoscaling/v2
+
+kind: HorizontalPodAutoscaler
+
+metadata:
+
+  name: video-processor-hpa
+
+spec:
+
+  scaleTargetRef:
+
+    apiVersion: apps/v1
+
+    kind: Deployment
+
+    name: video-processor
+
+  minReplicas: 2
+
+  maxReplicas: 10
+
+  metrics:
+
+  - type: Resource
+
+    resource:
+
+      name: cpu
+
+      target:
+
+        type: Utilization
+
+        averageUtilization: 70
+
+  - type: Resource
+
+    resource:
+
+      name: memory
+
+      target:
+
+        type: Utilization
+
+        averageUtilization: 80
+
+  - type: Pods
+
+    pods:
+
+      metric:
+
+        name: pending_tasks
+
+      target:
+
+        type: AverageValue
+
+        averageValue: "5"
+
+---
+
+# nginx.conf
+
+events {
+
+    worker_connections 1024;
+
+}
+
+http {
+
+    upstream backend {
+
+        server video_processor:8000;
+
+    }
+
+    server {
+
+        listen 80;
+
+        client_max_body_size 100M;
+
+        location / {
+
+            proxy_pass http://backend;
+
+            proxy_set_header Host $host;
+
+            proxy_set_header X-Real-IP $remote_addr;
+
+            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+
+            proxy_set_header X-Forwarded-Proto $scheme;
+
+            
+
+            # WebSocket support
+
+            proxy_http_version 1.1;
+
+            proxy_set_header Upgrade $http_upgrade;
+
+            proxy_set_header Connection "upgrade";
+
+        }
+
+        location /downloads/ {
+
+            alias /usr/share/nginx/html/;
+
+            autoindex on;
+
+            add_header Cache-Control "public, max-age=3600";
+
+        }
+
+    }
+
+}---------------------------------------------------#!/usr/bin/env python3
+
+"""
+
+FastAPI Server with Real-time Monitoring Dashboard
+
+"""
+
+import asyncio
+
+import json
+
+import os
+
+import uuid
+
+from datetime import datetime
+
+from pathlib import Path
+
+from typing import List, Optional, Dict, Any
+
+from enum import Enum
+
+from fastapi import FastAPI, HTTPException, BackgroundTasks, WebSocket, WebSocketDisconnect
+
+from fastapi.responses import HTMLResponse, FileResponse, StreamingResponse
+
+from fastapi.staticfiles import StaticFiles
+
+from fastapi.middleware.cors import CORSMiddleware
+
+from pydantic import BaseModel, Field, HttpUrl
+
+import uvicorn
+
+from prometheus_client import Counter, Histogram, Gauge, generate_latest
+
+import aioredis
+
+from celery import Celery
+
+from celery.result import AsyncResult
+
+# Import our main processor
+
+from main import VideoPlatform, Config, VideoMetadata
+
+# FastAPI app
+
+app = FastAPI(
+
+    title="Video Processing Platform API",
+
+    description="Enterprise-grade video downloading and processing",
+
+    version="2.0.0"
+
+)
+
+# CORS middleware
+
+app.add_middleware(
+
+    CORSMiddleware,
+
+    allow_origins=["*"],
+
+    allow_credentials=True,
+
+    allow_methods=["*"],
+
+    allow_headers=["*"],
+
+)
+
+# Celery configuration
+
+celery_app = Celery(
+
+    'video_processor',
+
+    broker='redis://localhost:6379/0',
+
+    backend='redis://localhost:6379/0'
+
+)
+
+# Metrics
+
+download_counter = Counter('video_downloads_total', 'Total number of video downloads')
+
+processing_histogram = Histogram('video_processing_duration_seconds', 'Video processing duration')
+
+active_jobs_gauge = Gauge('active_processing_jobs', 'Number of active processing jobs')
+
+storage_gauge = Gauge('storage_used_bytes', 'Storage used in bytes')
+
+# Models
+
+class JobStatus(str, Enum):
+
+    PENDING = "pending"
+
+    DOWNLOADING = "downloading"
+
+    PROCESSING = "processing"
+
+    MERGING = "merging"
+
+    COMPLETED = "completed"
+
+    FAILED = "failed"
+
+class VideoURL(BaseModel):
+
+    url: HttpUrl
+
+    episode_number: int = Field(..., ge=1, le=100)
+
+class ProcessingRequest(BaseModel):
+
+    urls: List[VideoURL]
+
+    season_name: str = Field(default="season1", min_length=1, max_length=50)
+
+    quality: str = Field(default="1080p", pattern="^(480|720|1080|2160)p$")
+
+    compression_level: int = Field(default=23, ge=18, le=28)
+
+    use_gpu: bool = True
+
+    priority: int = Field(default=5, ge=1, le=10)
+
+class JobResponse(BaseModel):
+
+    job_id: str
+
+    status: JobStatus
+
+    message: str
+
+    created_at: datetime
+
+    eta: Optional[int] = None
+
+class JobProgress(BaseModel):
+
+    job_id: str
+
+    status: JobStatus
+
+    progress: float
+
+    current_step: str
+
+    download_progress: Dict[int, float]
+
+    processing_speed: Optional[float]
+
+    eta_seconds: Optional[int]
+
+    errors: List[str]
+
+# Global state
+
+active_jobs: Dict[str, Dict[str, Any]] = {}
+
+websocket_connections: List[WebSocket] = []
+
+# Celery tasks
+
+@celery_app.task(bind=True, name='process_videos')
+
+def process_videos_task(self, job_id: str, request_data: dict):
+
+    """Background task for video processing"""
+
+    try:
+
+        # Update status
+
+        self.update_state(
+
+            state='PROCESSING',
+
+            meta={'current': 0, 'total': len(request_data['urls']), 'status': 'Initializing...'}
+
+        )
+
+        
+
+        # Create platform instance
+
+        config = Config(
+
+            use_hardware_accel=request_data['use_gpu'],
+
+            compression_preset='slow' if request_data['compression_level'] < 23 else 'medium'
+
+        )
+
+        platform = VideoPlatform(config)
+
+        
+
+        # Process videos
+
+        urls = [url['url'] for url in request_data['urls']]
+
+        result = asyncio.run(platform.process_season(urls, request_data['season_name']))
+
+        
+
+        return {
+
+            'job_id': job_id,
+
+            'status': 'completed',
+
+            'output_file': str(result),
+
+            'completed_at': datetime.utcnow().isoformat()
+
+        }
+
+    except Exception as e:
+
+        self.update_state(
+
+            state='FAILURE',
+
+            meta={'error': str(e)}
+
+        )
+
+        raise
+
+# API Routes
+
+@app.get("/")
+
+async def root():
+
+    """Root endpoint with dashboard"""
+
+    return HTMLResponse(content=dashboard_html, status_code=200)
+
+@app.post("/api/v1/process", response_model=JobResponse)
+
+async def create_processing_job(
+
+    request: ProcessingRequest,
+
+    background_tasks: BackgroundTasks
+
+):
+
+    """Create a new video processing job"""
+
+    job_id = str(uuid.uuid4())
+
+    
+
+    # Validate URLs
+
+    if len(request.urls) < 1:
+
+        raise HTTPException(status_code=400, detail="At least one URL required")
+
+    
+
+    # Create job
+
+    job_data = {
+
+        'job_id': job_id,
+
+        'status': JobStatus.PENDING,
+
+        'created_at': datetime.utcnow(),
+
+        'request': request.dict()
+
+    }
+
+    
+
+    active_jobs[job_id] = job_data
+
+    active_jobs_gauge.inc()
+
+    
+
+    # Queue task
+
+    task = process_videos_task.apply_async(
+
+        args=[job_id, request.dict()],
+
+        priority=request.priority
+
+    )
+
+    
+
+    active_jobs[job_id]['task_id'] = task.id
+
+    
+
+    return JobResponse(
+
+        job_id=job_id,
+
+        status=JobStatus.PENDING,
+
+        message="Job queued successfully",
+
+        created_at=job_data['created_at'],
+
+        eta=len(active_jobs) * 60  # Rough estimate
+
+    )
+
+@app.get("/api/v1/jobs/{job_id}", response_model=JobProgress)
+
+async def get_job_status(job_id: str):
+
+    """Get job status and progress"""
+
+    if job_id not in active_jobs:
+
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    
+
+    job = active_jobs[job_id]
+
+    task_id = job.get('task_id')
+
+    
+
+    if task_id:
+
+        result = AsyncResult(task_id, app=celery_app)
+
+        
+
+        if result.state == 'PENDING':
+
+            status = JobStatus.PENDING
+
+            progress = 0
+
+            current_step = "Waiting in queue"
+
+        elif result.state == 'PROCESSING':
+
+            meta = result.info
+
+            status = JobStatus.DOWNLOADING
+
+            progress = (meta.get('current', 0) / meta.get('total', 1)) * 100
+
+            current_step = meta.get('status', 'Processing...')
+
+        elif result.state == 'SUCCESS':
+
+            status = JobStatus.COMPLETED
+
+            progress = 100
+
+            current_step = "Completed"
+
+        else:
+
+            status = JobStatus.FAILED
+
+            progress = 0
+
+            current_step = f"Failed: {result.info.get('error', 'Unknown error')}"
+
+    else:
+
+        status = JobStatus.PENDING
+
+        progress = 0
+
+        current_step = "Initializing"
+
+    
+
+    return JobProgress(
+
+        job_id=job_id,
+
+        status=status,
+
+        progress=progress,
+
+        current_step=current_step,
+
+        download_progress={},
+
+        processing_speed=None,
+
+        eta_seconds=None,
+
+        errors=[]
+
+    )
+
+@app.delete("/api/v1/jobs/{job_id}")
+
+async def cancel_job(job_id: str):
+
+    """Cancel a processing job"""
+
+    if job_id not in active_jobs:
+
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    
+
+    job = active_jobs[job_id]
+
+    task_id = job.get('task_id')
+
+    
+
+    if task_id:
+
+        celery_app.control.revoke(task_id, terminate=True)
+
+    
+
+    active_jobs[job_id]['status'] = JobStatus.FAILED
+
+    active_jobs_gauge.dec()
+
+    
+
+    return {"message": "Job cancelled successfully"}
+
+@app.get("/api/v1/jobs")
+
+async def list_jobs(
+
+    status: Optional[JobStatus] = None,
+
+    limit: int = 50,
+
+    offset: int = 0
+
+):
+
+    """List all jobs with optional filtering"""
+
+    jobs = list(active_jobs.values())
+
+    
+
+    if status:
+
+        jobs = [j for j in jobs if j.get('status') == status]
+
+    
+
+    return {
+
+        "total": len(jobs),
+
+        "jobs": jobs[offset:offset + limit]
+
+    }
+
+@app.get("/api/v1/download/{job_id}")
+
+async def download_result(job_id: str):
+
+    """Download the processed video file"""
+
+    if job_id not in active_jobs:
+
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    
+
+    job = active_jobs[job_id]
+
+    
+
+    if job.get('status') != JobStatus.COMPLETED:
+
+        raise HTTPException(status_code=400, detail="Job not completed")
+
+    
+
+    output_file = job.get('output_file')
+
+    if not output_file or not Path(output_file).exists():
+
+        raise HTTPException(status_code=404, detail="Output file not found")
+
+    
+
+    download_counter.inc()
+
+    
+
+    return FileResponse(
+
+        output_file,
+
+        media_type='video/mp4',
+
+        filename=Path(output_file).name
+
+    )
+
+@app.websocket("/ws/{job_id}")
+
+async def websocket_endpoint(websocket: WebSocket, job_id: str):
+
+    """WebSocket for real-time job updates"""
+
+    await websocket.accept()
+
+    websocket_connections.append(websocket)
+
+    
+
+    try:
+
+        while True:
+
+            if job_id not in active_jobs:
+
+                await websocket.send_json({"error": "Job not found"})
+
+                break
+
+            
+
+            job = active_jobs[job_id]
+
+            task_id = job.get('task_id')
+
+            
+
+            if task_id:
+
+                result = AsyncResult(task_id, app=celery_app)
+
+                
+
+                update = {
+
+                    "job_id": job_id,
+
+                    "status": result.state,
+
+                    "progress": 0,
+
+                    "message": ""
+
+                }
+
+                
+
+                if result.state == 'PROCESSING':
+
+                    meta = result.info
+
+                    update['progress'] = (meta.get('current', 0) / meta.get('total', 1)) * 100
+
+                    update['message'] = meta.get('status', 'Processing...')
+
+                elif result.state == 'SUCCESS':
+
+                    update['progress'] = 100
+
+                    update['message'] = "Completed"
+
+                    update['download_url'] = f"/api/v1/download/{job_id}"
+
+                
+
+                await websocket.send_json(update)
+
+            
+
+            await asyncio.sleep(1)
+
+            
+
+    except WebSocketDisconnect:
+
+        websocket_connections.remove(websocket)
+
+@app.get("/api/v1/stats")
+
+async def get_stats():
+
+    """Get system statistics"""
+
+    import psutil
+
+    
+
+    return {
+
+        "system": {
+
+            "cpu_percent": psutil.cpu_percent(),
+
+            "memory_percent": psutil.virtual_memory().percent,
+
+            "disk_usage": psutil.disk_usage('/').percent
+
+        },
+
+        "jobs": {
+
+            "total": len(active_jobs),
+
+            "pending": len([j for j in active_jobs.values() if j.get('status') == JobStatus.PENDING]),
+
+            "processing": len([j for j in active_jobs.values() if j.get('status') == JobStatus.PROCESSING]),
+
+            "completed": len([j for j in active_jobs.values() if j.get('status') == JobStatus.COMPLETED]),
+
+            "failed": len([j for j in active_jobs.values() if j.get('status') == JobStatus.FAILED])
+
+        },
+
+        "performance": {
+
+            "downloads_total": download_counter._value.get(),
+
+            "active_connections": len(websocket_connections)
+
+        }
+
+    }
+
+@app.get("/metrics")
+
+async def metrics():
+
+    """Prometheus metrics endpoint"""
+
+    return StreamingResponse(
+
+        generate_latest(),
+
+        media_type="text/plain"
+
+    )
+
+# HTML Dashboard
+
+dashboard_html = """
+
+<!DOCTYPE html>
+
+<html lang="en">
+
+<head>
+
+    <meta charset="UTF-8">
+
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+
+    <title>Video Processing Platform</title>
+
+    <style>
+
+        * {
+
+            margin: 0;
+
+            padding: 0;
+
+            box-sizing: border-box;
+
+        }
+
+        
+
+        body {
+
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+
+            min-height: 100vh;
+
+            color: #333;
+
+        }
+
+        
+
+        .container {
+
+            max-width: 1400px;
+
+            margin: 0 auto;
+
+            padding: 20px;
+
+        }
+
+        
+
+        header {
+
+            background: rgba(255, 255, 255, 0.95);
+
+            backdrop-filter: blur(10px);
+
+            border-radius: 20px;
+
+            padding: 30px;
+
+            margin-bottom: 30px;
+
+            box-shadow: 0 20px 40px rgba(0,0,0,0.1);
+
+        }
+
+        
+
+        h1 {
+
+            font-size: 2.5em;
+
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+
+            -webkit-background-clip: text;
+
+            -webkit-text-fill-color: transparent;
+
+            margin-bottom: 10px;
+
+        }
+
+        
+
+        .subtitle {
+
+            color: #666;
+
+            font-size: 1.1em;
+
+        }
+
+        
+
+        .stats-grid {
+
+            display: grid;
+
+            grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+
+            gap: 20px;
+
+            margin-bottom: 30px;
+
+        }
+
+        
+
+        .stat-card {
+
+            background: rgba(255, 255, 255, 0.95);
+
+            border-radius: 15px;
+
+            padding: 25px;
+
+            box-shadow: 0 10px 30px rgba(0,0,0,0.1);
+
+            transition: transform 0.3s;
+
+        }
+
+        
+
+        .stat-card:hover {
+
+            transform: translateY(-5px);
+
+        }
+
+        
+
+        .stat-value {
+
+            font-size: 2.5em;
+
+            font-weight: bold;
+
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+
+            -webkit-background-clip: text;
+
+            -webkit-text-fill-color: transparent;
+
+        }
+
+        
+
+        .stat-label {
+
+            color: #666;
+
+            font-size: 0.9em;
+
+            text-transform: uppercase;
+
+            letter-spacing: 1px;
+
+            margin-top: 5px;
+
+        }
+
+        
+
+        .form-section {
+
+            background: rgba(255, 255, 255, 0.95);
+
+            border-radius: 20px;
+
+            padding: 30px;
+
+            margin-bottom: 30px;
+
+            box-shadow: 0 20px 40px rgba(0,0,0,0.1);
+
+        }
+
+        
+
+        .form-group {
+
+            margin-bottom: 20px;
+
+        }
+
+        
+
+        label {
+
+            display: block;
+
+            margin-bottom: 8px;
+
+            font-weight: 600;
+
+            color: #444;
+
+        }
+
+        
+
+        input, select, textarea {
+
+            width: 100%;
+
+            padding: 12px 15px;
+
+            border: 2px solid #e0e0e0;
+
+            border-radius: 10px;
+
+            font-size: 1em;
+
+            transition: border-color 0.3s;
+
+        }
+
+        
+
+        input:focus, select:focus, textarea:focus {
+
+            outline: none;
+
+            border-color: #667eea;
+
+        }
+
+        
+
+        textarea {
+
+            min-height: 150px;
+
+            resize: vertical;
+
+        }
+
+        
+
+        .btn {
+
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+
+            color: white;
+
+            border: none;
+
+            padding: 15px 40px;
+
+            font-size: 1.1em;
+
+            font-weight: 600;
+
+            border-radius: 50px;
+
+            cursor: pointer;
+
+            transition: transform 0.3s, box-shadow 0.3s;
+
+            display: inline-block;
+
+        }
+
+        
+
+        .btn:hover {
+
+            transform: translateY(-2px);
+
+            box-shadow: 0 10px 30px rgba(102, 126, 234, 0.4);
+
+        }
+
+        
+
+        .btn:disabled {
+
+            opacity: 0.5;
+
+            cursor: not-allowed;
+
+        }
+
+        
+
+        .jobs-list {
+
+            background: rgba(255, 255, 255, 0.95);
+
+            border-radius: 20px;
+
+            padding: 30px;
+
+            box-shadow: 0 20px 40px rgba(0,0,0,0.1);
+
+        }
+
+        
+
+        .job-item {
+
+            background: #f8f9fa;
+
+            border-radius: 12px;
+
+            padding: 20px;
+
+            margin-bottom: 15px;
+
+            display: flex;
+
+            justify-content: space-between;
+
+            align-items: center;
+
+            transition: transform 0.3s;
+
+        }
+
+        
+
+        .job-item:hover {
+
+            transform: translateX(5px);
+
+        }
+
+        
+
+        .job-status {
+
+            padding: 5px 15px;
+
+            border-radius: 20px;
+
+            font-size: 0.9em;
+
+            font-weight: 600;
+
+        }
+
+        
+
+        .status-pending {
+
+            background: #ffeaa7;
+
+            color: #fdcb6e;
+
+        }
+
+        
+
+        .status-processing {
+
+            background: #74b9ff;
+
+            color: #0984e3;
+
+        }
+
+        
+
+        .status-completed {
+
+            background: #55efc4;
+
+            color: #00b894;
+
+        }
+
+        
+
+        .status-failed {
+
+            background: #ff7675;
+
+            color: #d63031;
+
+        }
+
+        
+
+        .progress-bar {
+
+            width: 200px;
+
+            height: 8px;
+
+            background: #e0e0e0;
+
+            border-radius: 10px;
+
+            overflow: hidden;
+
+            margin: 10px 0;
+
+        }
+
+        
+
+        .progress-fill {
+
+            height: 100%;
+
+            background: linear-gradient(90deg, #667eea 0%, #764ba2 100%);
+
+            transition: width 0.5s ease;
+
+        }
+
+        
+
+        @keyframes pulse {
+
+            0% { opacity: 1; }
+
+            50% { opacity: 0.5; }
+
+            100% { opacity: 1; }
+
+        }
+
+        
+
+        .loading {
+
+            animation: pulse 2s infinite;
+
+        }
+
+    </style>
+
+</head>
+
+<body>
+
+    <div class="container">
+
+        <header>
+
+            <h1>🚀 Video Processing Platform</h1>
+
+            <p class="subtitle">Enterprise-Grade Video Processing with GPU Acceleration</p>
+
+        </header>
+
+        
+
+        <div class="stats-grid">
+
+            <div class="stat-card">
+
+                <div class="stat-value" id="active-jobs">0</div>
+
+                <div class="stat-label">Active Jobs</div>
+
+            </div>
+
+            <div class="stat-card">
+
+                <div class="stat-value" id="cpu-usage">0%</div>
+
+                <div class="stat-label">CPU Usage</div>
+
+            </div>
+
+            <div class="stat-card">
+
+                <div class="stat-value" id="memory-usage">0%</div>
+
+                <div class="stat-label">Memory Usage</div>
+
+            </div>
+
+            <div class="stat-card">
+
+                <div class="stat-value" id="total-processed">0</div>
+
+                <div class="stat-label">Videos Processed</div>
+
+            </div>
+
+        </div>
+
+        
+
+        <div class="form-section">
+
+            <h2>Create New Job</h2>
+
+            <form id="job-form">
+
+                <div class="form-group">
+
+                    <label for="urls">Video URLs (one per line)</label>
+
+                    <textarea id="urls" placeholder="https://example.com/video1.mp4&#10;https://example.com/video2.mp4" required></textarea>
+
+                </div>
+
+                <div class="form-group">
+
+                    <label for="season">Season Name</label>
+
+                    <input type="text" id="season" value="season1" required>
+
+                </div>
+
+                <div class="form-group">
+
+                    <label for="quality">Quality</label>
+
+                    <select id="quality">
+
+                        <option value="1080p">1080p</option>
+
+                        <option value="720p">720p</option>
+
+                        <option value="480p">480p</option>
+
+                    </select>
+
+                </div>
+
+                <div class="form-group">
+
+                    <label>
+
+                        <input type="checkbox" id="gpu" checked> Enable GPU Acceleration
+
+                    </label>
+
+                </div>
+
+                <button type="submit" class="btn">Start Processing</button>
+
+            </form>
+
+        </div>
+
+        
+
+        <div class="jobs-list">
+
+            <h2>Active Jobs</h2>
+
+            <div id="jobs-container"></div>
+
+        </div>
+
+    </div>
+
+    
+
+    <script>
+
+        // Update stats every 2 seconds
+
+        async function updateStats() {
+
+            try {
+
+                const response = await fetch('/api/v1/stats');
+
+                const data = await response.json();
+
+                
+
+                document.getElementById('active-jobs').textContent = data.jobs.processing || 0;
+
+                document.getElementById('cpu-usage').textContent = Math.round(data.system.cpu_percent) + '%';
+
+                document.getElementById('memory-usage').textContent = Math.round(data.system.memory_percent) + '%';
+
+                document.getElementById('total-processed').textContent = data.jobs.completed || 0;
+
+            } catch (error) {
+
+                console.error('Error updating stats:', error);
+
+            }
+
+        }
+
+        
+
+        // Update jobs list
+
+        async function updateJobs() {
+
+            try {
+
+                const response = await fetch('/api/v1/jobs');
+
+                const data = await response.json();
+
+                
+
+                const container = document.getElementById('jobs-container');
+
+                container.innerHTML = '';
+
+                
+
+                data.jobs.forEach(job => {
+
+                    const jobDiv = document.createElement('div');
+
+                    jobDiv.className = 'job-item';
+
+                    jobDiv.innerHTML = `
+
+                        <div>
+
+                            <strong>${job.job_id.substring(0, 8)}</strong>
+
+                            <div class="progress-bar">
+
+                                <div class="progress-fill" style="width: ${job.progress || 0}%"></div>
+
+                            </div>
+
+                        </div>
+
+                        <span class="job-status status-${job.status}">${job.status}</span>
+
+                    `;
+
+                    container.appendChild(jobDiv);
+
+                });
+
+            } catch (error) {
+
+                console.error('Error updating jobs:', error);
+
+            }
+
+        }
+
+        
+
+        // Handle form submission
+
+        document.getElementById('job-form').addEventListener('submit', async (e) => {
+
+            e.preventDefault();
+
+            
+
+            const urls = document.getElementById('urls').value.split('\\n')
+
+                .filter(url => url.trim())
+
+                .map((url, i) => ({
+
+                    url: url.trim(),
+
+                    episode_number: i + 1
+
+                }));
+
+            
+
+            const data = {
+
+                urls: urls,
+
+                season_name: document.getElementById('season').value,
+
+                quality: document.getElementById('quality').value,
+
+                use_gpu: document.getElementById('gpu').checked
+
+            };
+
+            
+
+            try {
+
+                const response = await fetch('/api/v1/process', {
+
+                    method: 'POST',
+
+                    headers: {
+
+                        'Content-Type': 'application/json'
+
+                    },
+
+                    body: JSON.stringify(data)
+
+                });
+
+                
+
+                const result = await response.json();
+
+                
+
+                if (response.ok) {
+
+                    alert(`Job created successfully! ID: ${result.job_id}`);
+
+                    document.getElementById('job-form').reset();
+
+                    updateJobs();
+
+                } else {
+
+                    alert(`Error: ${result.detail}`);
+
+                }
+
+            } catch (error) {
+
+                alert('Error creating job: ' + error.message);
+
+            }
+
+        });
+
+        
+
+        // Initial load and periodic updates
+
+        updateStats();
+
+        updateJobs();
+
+        setInterval(updateStats, 2000);
+
+        setInterval(updateJobs, 3000);
+
+    </script>
+
+</body>
+
+</html>
+
+"""
+
+if __name__ == "__main__":
+
+    uvicorn.run(
+
+        "api_server:app",
+
+        host="0.0.0.0",
+
+        port=8000,
+
+        reload=True,
+
+        workers=4
+
+    )
