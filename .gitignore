@@ -50,3 +50,6 @@ dist/
 build/
 *.tgz
 *.tar.gz
+
+# Empty directories from restructuring
+video-processing-platform/
