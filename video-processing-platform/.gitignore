@@ -1,1 +1,52 @@
-# Git ignore rules
+# Database data files (should not be committed)
+database/postgres-data/
+database/redis-data/
+
+# Node.js dependencies
+api-server/node_modules/
+api-server/package-lock.json
+
+# Environment files
+api-server/.env
+.env
+.env.local
+.env.production
+
+# Uploaded files
+api-server/uploads/
+uploads/
+
+# Logs
+*.log
+logs/
+api-server/logs/
+
+# OS generated files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Temporary files
+*.tmp
+*.temp
+.cache/
+
+# Docker volumes (if any)
+volumes/
+
+# Build artifacts
+dist/
+build/
+*.tgz
+*.tar.gz
