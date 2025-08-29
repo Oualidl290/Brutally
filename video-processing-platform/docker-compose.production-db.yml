@@ -1,0 +1,246 @@
+version: '3.8'
+
+services:
+  # PostgreSQL Database - Production Ready
+  postgres:
+    image: postgres:15-alpine
+    container_name: video_processing_postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: video_processing_prod
+      POSTGRES_USER: video_admin
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-VerySecurePassword123!}
+      POSTGRES_INITDB_ARGS: "--encoding=UTF-8 --lc-collate=C --lc-ctype=C"
+      # Performance tuning
+      POSTGRES_SHARED_PRELOAD_LIBRARIES: "pg_stat_statements"
+    ports:
+      - "5432:5432"
+    volumes:
+      # Persistent data storage
+      - postgres_data:/var/lib/postgresql/data
+      # Custom PostgreSQL configuration
+      - ./database/postgresql.conf:/etc/postgresql/postgresql.conf:ro
+      # Initialization scripts
+      - ./database/init-scripts:/docker-entrypoint-initdb.d:ro
+      # Backup directory
+      - ./database/backups:/backups
+    command: >
+      postgres
+      -c config_file=/etc/postgresql/postgresql.conf
+      -c log_statement=all
+      -c log_destination=stderr
+      -c logging_collector=on
+      -c log_directory=/var/log/postgresql
+      -c log_filename=postgresql-%Y-%m-%d.log
+      -c log_rotation_age=1d
+      -c log_rotation_size=100MB
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U video_admin -d video_processing_prod"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    networks:
+      - video_processing_network
+
+  # Redis - Production Ready with Persistence
+  redis:
+    image: redis:7-alpine
+    container_name: video_processing_redis
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    volumes:
+      # Persistent data storage
+      - redis_data:/data
+      # Custom Redis configuration
+      - ./database/redis.conf:/usr/local/etc/redis/redis.conf:ro
+    command: >
+      redis-server /usr/local/etc/redis/redis.conf
+      --appendonly yes
+      --appendfsync everysec
+      --save 900 1
+      --save 300 10
+      --save 60 10000
+      --maxmemory 1gb
+      --maxmemory-policy allkeys-lru
+      --tcp-keepalive 300
+      --timeout 0
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 30s
+    networks:
+      - video_processing_network
+
+  # Redis Sentinel for High Availability (Optional)
+  redis-sentinel:
+    image: redis:7-alpine
+    container_name: video_processing_redis_sentinel
+    restart: unless-stopped
+    ports:
+      - "26379:26379"
+    volumes:
+      - ./database/sentinel.conf:/usr/local/etc/redis/sentinel.conf:ro
+    command: redis-sentinel /usr/local/etc/redis/sentinel.conf
+    depends_on:
+      - redis
+    networks:
+      - video_processing_network
+    profiles:
+      - ha  # Only start with --profile ha
+
+  # PostgreSQL Connection Pooler (PgBouncer)
+  pgbouncer:
+    image: pgbouncer/pgbouncer:latest
+    container_name: video_processing_pgbouncer
+    restart: unless-stopped
+    environment:
+      DATABASES_HOST: postgres
+      DATABASES_PORT: 5432
+      DATABASES_USER: video_admin
+      DATABASES_PASSWORD: ${POSTGRES_PASSWORD:-VerySecurePassword123!}
+      DATABASES_DBNAME: video_processing_prod
+      POOL_MODE: transaction
+      SERVER_RESET_QUERY: DISCARD ALL
+      MAX_CLIENT_CONN: 1000
+      DEFAULT_POOL_SIZE: 25
+      MIN_POOL_SIZE: 5
+      RESERVE_POOL_SIZE: 5
+      SERVER_LIFETIME: 3600
+      SERVER_IDLE_TIMEOUT: 600
+      LOG_CONNECTIONS: 1
+      LOG_DISCONNECTIONS: 1
+    ports:
+      - "6432:5432"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - video_processing_network
+
+  # Database Backup Service
+  postgres-backup:
+    image: postgres:15-alpine
+    container_name: video_processing_backup
+    restart: "no"
+    environment:
+      PGPASSWORD: ${POSTGRES_PASSWORD:-VerySecurePassword123!}
+    volumes:
+      - ./database/backups:/backups
+      - ./database/backup-scripts:/scripts:ro
+    command: >
+      sh -c "
+        echo 'Setting up backup cron job...'
+        echo '0 2 * * * /scripts/backup.sh' | crontab -
+        echo 'Starting cron daemon...'
+        crond -f
+      "
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - video_processing_network
+    profiles:
+      - backup
+
+  # Database Monitoring with Prometheus
+  postgres-exporter:
+    image: prometheuscommunity/postgres-exporter:latest
+    container_name: video_processing_postgres_exporter
+    restart: unless-stopped
+    environment:
+      DATA_SOURCE_NAME: "postgresql://video_admin:${POSTGRES_PASSWORD:-VerySecurePassword123!}@postgres:5432/video_processing_prod?sslmode=disable"
+    ports:
+      - "9187:9187"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - video_processing_network
+    profiles:
+      - monitoring
+
+  # Redis Monitoring
+  redis-exporter:
+    image: oliver006/redis_exporter:latest
+    container_name: video_processing_redis_exporter
+    restart: unless-stopped
+    environment:
+      REDIS_ADDR: "redis://redis:6379"
+    ports:
+      - "9121:9121"
+    depends_on:
+      redis:
+        condition: service_healthy
+    networks:
+      - video_processing_network
+    profiles:
+      - monitoring
+
+  # Database Administration Interface
+  pgadmin:
+    image: dpage/pgadmin4:latest
+    container_name: video_processing_pgadmin
+    restart: unless-stopped
+    environment:
+      PGADMIN_DEFAULT_EMAIL: admin@videoprocessing.com
+      PGADMIN_DEFAULT_PASSWORD: ${PGADMIN_PASSWORD:-AdminPassword123!}
+      PGADMIN_CONFIG_SERVER_MODE: 'False'
+      PGADMIN_CONFIG_MASTER_PASSWORD_REQUIRED: 'False'
+    ports:
+      - "5050:80"
+    volumes:
+      - pgadmin_data:/var/lib/pgadmin
+      - ./database/pgadmin-servers.json:/pgadmin4/servers.json:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - video_processing_network
+    profiles:
+      - admin
+
+  # Redis Administration Interface
+  redis-commander:
+    image: rediscommander/redis-commander:latest
+    container_name: video_processing_redis_commander
+    restart: unless-stopped
+    environment:
+      REDIS_HOSTS: "local:redis:6379"
+      HTTP_USER: admin
+      HTTP_PASSWORD: ${REDIS_ADMIN_PASSWORD:-AdminPassword123!}
+    ports:
+      - "8081:8081"
+    depends_on:
+      redis:
+        condition: service_healthy
+    networks:
+      - video_processing_network
+    profiles:
+      - admin
+
+volumes:
+  postgres_data:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: ./database/postgres-data
+  redis_data:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: ./database/redis-data
+  pgadmin_data:
+    driver: local
+
+networks:
+  video_processing_network:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.20.0.0/16
